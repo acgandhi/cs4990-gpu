@@ -1,0 +1,6 @@
+.idea
+.idea/**
+cs4990-gpu.iml
+*.exe
+*.exp
+*.lib

@@ -7,7 +7,7 @@
 
 const int BLOCK_SIZE = 1024;
 enum VERBOSITY_LEVEL {LOW, MED, HIGH};
-const VERBOSITY_LEVEL VERBOSITY = MED;
+const VERBOSITY_LEVEL VERBOSITY = LOW;
 
 #define CHECK(call) { \
     cudaError_t err = call; \
@@ -41,8 +41,6 @@ void printTimeDelta(const char *msg, long start, long end) {
 void generateRandMatrix(int m, int n, float *A) {
     for (int i = 0; i < m*n; i++) {
         A[i] = (rand()%200 - 100)/100.0;
-        // ***
-        // A[i] = i;
     }
 }
 
@@ -149,26 +147,21 @@ __global__ void matrixMulKernel_1thread1element(int m, int k, int n, const float
     }
 }
 
-#define PRINT_IDX 0
-
 __global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, const float *B_d, float* C_d, size_t Adz_sz, size_t Bdz_sz) {
     extern __shared__ char As_Bs[];
     // assume square tiles of equal size for A and B
     const unsigned int TILE_DIM = (unsigned int) sqrtf(Adz_sz/sizeof(float));
     // const unsigned int TILE_DIM_B = (unsigned int) sqrtf(Bdz_sz)/sizeof(float);
 
-    if (threadIdx.x == PRINT_IDX && threadIdx.y == PRINT_IDX) {
-        printf("TILE_DIM: %d\n", TILE_DIM);
-    }
-
     float *A_s = (float *) As_Bs;
     float *B_s = &A_s[TILE_DIM*TILE_DIM];
     unsigned int row = blockIdx.y*blockDim.y + threadIdx.y;
     unsigned int col = blockIdx.x*blockDim.x + threadIdx.x;
     float sum = 0.0f;
-    for(unsigned int tile = 0; tile < k/TILE_DIM; ++tile) {
+    for(unsigned int tile = 0; (float) tile < (float) k/TILE_DIM; ++tile) {
         // Load tile to shared memory
         // make sure that row < nRows in A and index in row < length of row in A
+
         if (row < m && (tile*TILE_DIM + threadIdx.x) < k) {
             A_s[TILE_DIM * threadIdx.y + threadIdx.x] = A_d[row*k + tile*TILE_DIM + threadIdx.x];
         } else {
@@ -181,18 +174,14 @@ __global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, con
             B_s[TILE_DIM * threadIdx.y + threadIdx.x] = 0.0f;
         }
         __syncthreads();
-        if (threadIdx.x == PRINT_IDX && threadIdx.y == PRINT_IDX) {
-            printf("*** A_s[0]: %f, B_s[0]: %f, row %d col %d\n", A_s[0], B_s[0], row, col);
-        }
+
         // Compute with tile
         for(unsigned int i = 0; i < TILE_DIM; ++i) {
             sum += A_s[TILE_DIM * threadIdx.y + i]*B_s[TILE_DIM * i + threadIdx.x];
         }
         __syncthreads();
     }
-    if (threadIdx.x == PRINT_IDX && threadIdx.y == PRINT_IDX) {
-        printf("*** Sum: %f, row %d col %d\n", sum, row, col);
-    }
+
     if (row < m && col < n) 
         C_d[row*n + col] = sum;
 }

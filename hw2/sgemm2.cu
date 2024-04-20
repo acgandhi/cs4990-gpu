@@ -7,7 +7,7 @@
 
 const int BLOCK_SIZE = 1024;
 enum VERBOSITY_LEVEL {LOW, MED, HIGH};
-const VERBOSITY_LEVEL VERBOSITY = LOW;
+const VERBOSITY_LEVEL VERBOSITY = MED;
 
 #define CHECK(call) { \
     cudaError_t err = call; \
@@ -41,6 +41,8 @@ void printTimeDelta(const char *msg, long start, long end) {
 void generateRandMatrix(int m, int n, float *A) {
     for (int i = 0; i < m*n; i++) {
         A[i] = (rand()%200 - 100)/100.0;
+        // ***
+        // A[i] = i;
     }
 }
 
@@ -58,7 +60,7 @@ int matEq(int m, int n, float *A, float *B) {
     int rv = 1;
     for (int i = 0; i < m*n; i++) {
         if (abs((A[i] / B[i]) - 1.0) > 0.01 && abs((A[i] - B[i]) > 0.0001)) {
-            if (VERBOSITY >= HIGH) {
+            if (VERBOSITY >= MED) {
                 printf("A[%d] = %f, B[%d] = %f\n", i, A[i], i, B[i]);
                 // Print integer representation of floats bits for debugging
                 int* xi = (int*)((void*)&A[i]);
@@ -113,9 +115,12 @@ void copyToHost(int m, int n, const float *C_d, float *C_h) {
     printTimeDelta("\tCuda Memcpy DeviceToHost", t0, myCpuTimer());
 }
 
-size_t calculateAppropriateSharedMemSize(size_t sharedMemPerBlock) {
-    int tileWidth = (int) sqrt((float) sharedMemPerBlock/(sizeof(float)*2.0));
-    return 2*tileWidth*tileWidth*sizeof(float);
+size_t calculateAppropriateSharedMemSize(size_t sharedMemPerBlock, int threadsPerBlock, size_t dataSize) {
+    int tileWidth = (int) sqrt((float) sharedMemPerBlock/(dataSize*2.0));
+    int blockWidth = (int) sqrt((float) threadsPerBlock);
+    // doesn't make sense to have a tile larger than the block
+    tileWidth = min(tileWidth, blockWidth);
+    return 2*tileWidth*tileWidth*dataSize;
 }
 
 void basicSgemm_h(int m, int k, int n, const float *A_h, const float *B_h, float* C_h){
@@ -144,27 +149,52 @@ __global__ void matrixMulKernel_1thread1element(int m, int k, int n, const float
     }
 }
 
+#define PRINT_IDX 0
+
 __global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, const float *B_d, float* C_d, size_t Adz_sz, size_t Bdz_sz) {
     extern __shared__ char As_Bs[];
-    const unsigned long long TILE_DIM_A = Adz_sz / sizeof(float);
-    const unsigned long long TILE_DIM_B = Bdz_sz / sizeof(float);
+    // assume square tiles of equal size for A and B
+    const unsigned int TILE_DIM = (unsigned int) sqrtf(Adz_sz/sizeof(float));
+    // const unsigned int TILE_DIM_B = (unsigned int) sqrtf(Bdz_sz)/sizeof(float);
+
+    if (threadIdx.x == PRINT_IDX && threadIdx.y == PRINT_IDX) {
+        printf("TILE_DIM: %d\n", TILE_DIM);
+    }
+
     float *A_s = (float *) As_Bs;
-    float *B_s = &A_s[TILE_DIM_A*TILE_DIM_A];
+    float *B_s = &A_s[TILE_DIM*TILE_DIM];
     unsigned int row = blockIdx.y*blockDim.y + threadIdx.y;
     unsigned int col = blockIdx.x*blockDim.x + threadIdx.x;
     float sum = 0.0f;
-    for(unsigned int tile = 0; tile < n/TILE_DIM_A; ++tile) {
+    for(unsigned int tile = 0; tile < k/TILE_DIM; ++tile) {
         // Load tile to shared memory
-        A_s[TILE_DIM_A * threadIdx.y + threadIdx.x] = A_d[row*n + tile*TILE_DIM_A + threadIdx.x];
-        B_s[TILE_DIM_B * threadIdx.y + threadIdx.x] = B_d[(tile*TILE_DIM_B + threadIdx.y)*n + col];
+        // make sure that row < nRows in A and index in row < length of row in A
+        if (row < m && (tile*TILE_DIM + threadIdx.x) < k) {
+            A_s[TILE_DIM * threadIdx.y + threadIdx.x] = A_d[row*k + tile*TILE_DIM + threadIdx.x];
+        } else {
+            A_s[TILE_DIM * threadIdx.y + threadIdx.x] = 0.0f;
+        }
+        // make sure that row < nCols in B and index in col < length of col in B
+        if (col < n && (tile*TILE_DIM + threadIdx.y) < k) {
+            B_s[TILE_DIM * threadIdx.y + threadIdx.x] = B_d[(tile*TILE_DIM + threadIdx.y)*n + col];
+        } else {
+            B_s[TILE_DIM * threadIdx.y + threadIdx.x] = 0.0f;
+        }
         __syncthreads();
+        if (threadIdx.x == PRINT_IDX && threadIdx.y == PRINT_IDX) {
+            printf("*** A_s[0]: %f, B_s[0]: %f, row %d col %d\n", A_s[0], B_s[0], row, col);
+        }
         // Compute with tile
-        for(unsigned int i = 0; i < TILE_DIM_A; ++i) {
-            sum += A_s[TILE_DIM_A * threadIdx.y + i]*B_s[TILE_DIM_B * i + threadIdx.x];
+        for(unsigned int i = 0; i < TILE_DIM; ++i) {
+            sum += A_s[TILE_DIM * threadIdx.y + i]*B_s[TILE_DIM * i + threadIdx.x];
         }
         __syncthreads();
     }
-    C_d[row*n + col] = sum;
+    if (threadIdx.x == PRINT_IDX && threadIdx.y == PRINT_IDX) {
+        printf("*** Sum: %f, row %d col %d\n", sum, row, col);
+    }
+    if (row < m && col < n) 
+        C_d[row*n + col] = sum;
 }
 
 
@@ -193,13 +223,20 @@ void basicSgemm_d_tiled(int m, int k, int n, const float *A_h, const float *B_h,
 
     cudaDeviceProp properties;
     CHECK(cudaGetDeviceProperties(&properties, 0));
-    size_t tile_sz = calculateAppropriateSharedMemSize(properties.sharedMemPerBlock);
-    printf("Tile Size: %zd\n", tile_sz);
-    dim3 blockDim = {32, 32, 1};
+    const int MAX_THREADS_PER_BLOCK = properties.maxThreadsPerBlock;
+    const size_t MAX_SHARED_MEM_PER_BLOCK = properties.sharedMemPerBlock;
+
+    size_t tileSz = calculateAppropriateSharedMemSize(MAX_SHARED_MEM_PER_BLOCK, MAX_THREADS_PER_BLOCK, sizeof(float));
+    unsigned int blockSize = (unsigned int) sqrt((float) tileSz/(2*sizeof(float)));
+    printf("*** Block Size: %d\n", blockSize);
+    // size_t tileSz = min(calculateAppropriateSharedMemSize(properties.sharedMemPerBlock), (unsigned long long) 2 * (32*sizeof(float) * 32*sizeof(float)));
+    printf("*** Tile Size: %zd\n", tileSz);
+    dim3 blockDim = {blockSize, blockSize, 1};
     dim3 gridDim = {(unsigned int) ceil((float)n/blockDim.x), (unsigned int) ceil((float)m/blockDim.y), 1};
+    printf("*** Grid Dim: %d, %d\n", gridDim.x, gridDim.y);
 
     long t0 = myCpuTimer();
-    matrixMulKernel_tiled<<<gridDim, blockDim, tile_sz>>>(m, k, n, A_d, B_d, C_d, tile_sz/2, tile_sz/2);
+    matrixMulKernel_tiled<<<gridDim, blockDim, tileSz>>>(m, k, n, A_d, B_d, C_d, tileSz/2, tileSz/2);
     CHECK(cudaDeviceSynchronize());
     printTimeDelta("\tKernel Execution", t0, myCpuTimer());
 
@@ -240,7 +277,9 @@ int main(int argc, char const *argv[]) {
         printMatrix(k, n, B_h);
         printMatrix(m, n, C_h);
         printMatrix(m, n, C_h_1t1e);
+        printMatrix(m, n, C_h_tiled);
     }
+    // printMatrix(m, n, C_h_tiled);
 
     if(matEq(m, n, C_h, C_h_1t1e)){
         printf("1 Thread 1 Element: Correct\n");

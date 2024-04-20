@@ -217,12 +217,8 @@ void basicSgemm_d_tiled(int m, int k, int n, const float *A_h, const float *B_h,
 
     size_t tileSz = calculateAppropriateSharedMemSize(MAX_SHARED_MEM_PER_BLOCK, MAX_THREADS_PER_BLOCK, sizeof(float));
     unsigned int blockSize = (unsigned int) sqrt((float) tileSz/(2*sizeof(float)));
-    printf("*** Block Size: %d\n", blockSize);
-    // size_t tileSz = min(calculateAppropriateSharedMemSize(properties.sharedMemPerBlock), (unsigned long long) 2 * (32*sizeof(float) * 32*sizeof(float)));
-    printf("*** Tile Size: %zd\n", tileSz);
     dim3 blockDim = {blockSize, blockSize, 1};
     dim3 gridDim = {(unsigned int) ceil((float)n/blockDim.x), (unsigned int) ceil((float)m/blockDim.y), 1};
-    printf("*** Grid Dim: %d, %d\n", gridDim.x, gridDim.y);
 
     long t0 = myCpuTimer();
     matrixMulKernel_tiled<<<gridDim, blockDim, tileSz>>>(m, k, n, A_d, B_d, C_d, tileSz/2, tileSz/2);
@@ -268,7 +264,6 @@ int main(int argc, char const *argv[]) {
         printMatrix(m, n, C_h_1t1e);
         printMatrix(m, n, C_h_tiled);
     }
-    // printMatrix(m, n, C_h_tiled);
 
     if(matEq(m, n, C_h, C_h_1t1e)){
         printf("1 Thread 1 Element: Correct\n");

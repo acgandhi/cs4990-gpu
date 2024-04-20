@@ -5,7 +5,7 @@
 #include <windows.h>
 #include <profileapi.h>
 
-const int BLOCK_SIZE = 512;
+const int BLOCK_SIZE = 1024;
 enum VERBOSITY_LEVEL {LOW, MED, HIGH};
 const VERBOSITY_LEVEL VERBOSITY = LOW;
 
@@ -58,11 +58,13 @@ int matEq(int m, int n, float *A, float *B) {
     int rv = 1;
     for (int i = 0; i < m*n; i++) {
         if (abs((A[i] / B[i]) - 1.0) > 0.01 && abs((A[i] - B[i]) > 0.0001)) {
-            printf("A[%d] = %f, B[%d] = %f\n", i, A[i], i, B[i]);
-            // Print integer representation of floats bits for debugging
-            int* xi = (int*)((void*)&A[i]);
-            int* yi = (int*)((void*)&B[i]);
-            printf("A[%d] = %d, B[%d] = %d\n", i, *xi, i, *yi);
+            if (VERBOSITY >= HIGH) {
+                printf("A[%d] = %f, B[%d] = %f\n", i, A[i], i, B[i]);
+                // Print integer representation of floats bits for debugging
+                int* xi = (int*)((void*)&A[i]);
+                int* yi = (int*)((void*)&B[i]);
+                printf("A[%d] = %d, B[%d] = %d\n", i, *xi, i, *yi);
+            }
             rv = 0;
         }
     }
@@ -111,6 +113,11 @@ void copyToHost(int m, int n, const float *C_d, float *C_h) {
     printTimeDelta("\tCuda Memcpy DeviceToHost", t0, myCpuTimer());
 }
 
+size_t calculateAppropriateSharedMemSize(size_t sharedMemPerBlock) {
+    int tileWidth = (int) sqrt((float) sharedMemPerBlock/(sizeof(float)*2.0));
+    return 2*tileWidth*tileWidth*sizeof(float);
+}
+
 void basicSgemm_h(int m, int k, int n, const float *A_h, const float *B_h, float* C_h){
     printf("Basic (Host) Matrix Multiplication \n");
     long t0 = myCpuTimer();
@@ -137,6 +144,29 @@ __global__ void matrixMulKernel_1thread1element(int m, int k, int n, const float
     }
 }
 
+__global__ void matrixMulKernel_tiled(int m, int k, int n, const float *A_d, const float *B_d, float* C_d, size_t Adz_sz, size_t Bdz_sz) {
+    extern __shared__ char As_Bs[];
+    const unsigned long long TILE_DIM_A = Adz_sz / sizeof(float);
+    const unsigned long long TILE_DIM_B = Bdz_sz / sizeof(float);
+    float *A_s = (float *) As_Bs;
+    float *B_s = &A_s[TILE_DIM_A*TILE_DIM_A];
+    unsigned int row = blockIdx.y*blockDim.y + threadIdx.y;
+    unsigned int col = blockIdx.x*blockDim.x + threadIdx.x;
+    float sum = 0.0f;
+    for(unsigned int tile = 0; tile < n/TILE_DIM_A; ++tile) {
+        // Load tile to shared memory
+        A_s[TILE_DIM_A * threadIdx.y + threadIdx.x] = A_d[row*n + tile*TILE_DIM_A + threadIdx.x];
+        B_s[TILE_DIM_B * threadIdx.y + threadIdx.x] = B_d[(tile*TILE_DIM_B + threadIdx.y)*n + col];
+        __syncthreads();
+        // Compute with tile
+        for(unsigned int i = 0; i < TILE_DIM_A; ++i) {
+            sum += A_s[TILE_DIM_A * threadIdx.y + i]*B_s[TILE_DIM_B * i + threadIdx.x];
+        }
+        __syncthreads();
+    }
+    C_d[row*n + col] = sum;
+}
+
 
 void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const float *B_h, float* C_h) {
     printf("Device Matrix Multiplication: 1 Thread-1 Element\n");
@@ -152,9 +182,32 @@ void basicSgemm_d_1thread1element(int m, int k, int n, const float *A_h, const f
 
     copyToHost(m, n, C_d, C_h);
     freeDeviceMatrices(A_d, B_d, C_d);
+}   
+
+void basicSgemm_d_tiled(int m, int k, int n, const float *A_h, const float *B_h, float* C_h) {
+    printf("Device Matrix Multiplication: Tiled\n");
+    float *A_d, *B_d, *C_d;
+    allocDeviceMatrices(m, k, n, &A_d, &B_d, &C_d);
+    copyToDevice(m, k, n, A_h, B_h, A_d, B_d);
+
+
+    cudaDeviceProp properties;
+    CHECK(cudaGetDeviceProperties(&properties, 0));
+    size_t tile_sz = calculateAppropriateSharedMemSize(properties.sharedMemPerBlock);
+    printf("Tile Size: %zd\n", tile_sz);
+    dim3 blockDim = {32, 32, 1};
+    dim3 gridDim = {(unsigned int) ceil((float)n/blockDim.x), (unsigned int) ceil((float)m/blockDim.y), 1};
+
+    long t0 = myCpuTimer();
+    matrixMulKernel_tiled<<<gridDim, blockDim, tile_sz>>>(m, k, n, A_d, B_d, C_d, tile_sz/2, tile_sz/2);
+    CHECK(cudaDeviceSynchronize());
+    printTimeDelta("\tKernel Execution", t0, myCpuTimer());
+
+    copyToHost(m, n, C_d, C_h);
+    freeDeviceMatrices(A_d, B_d, C_d);
 }
 
-int main(int argc, char const *argv[]) {
+int main(int argc, char const *argv[]) {    
     // arg parsing
     if (argc != 4) {
         printf("Usage: %s <m> <k> <n>\n", argv[0]);
@@ -173,12 +226,14 @@ int main(int argc, char const *argv[]) {
     // create output (C) matrices
     float *C_h = (float*)malloc(m*n*sizeof(float));
     float *C_h_1t1e = (float*)malloc(m*n*sizeof(float));
+    float *C_h_tiled = (float*)malloc(m*n*sizeof(float));
 
     warmupGPU();
 
     // do matrix multiplication
     basicSgemm_h(m, k, n, A_h, B_h, C_h);
     basicSgemm_d_1thread1element(m, k, n, A_h, B_h, C_h_1t1e);
+    basicSgemm_d_tiled(m, k, n, A_h, B_h, C_h_tiled);
 
     if (VERBOSITY >= HIGH) {
         printMatrix(m, k, A_h);
@@ -191,6 +246,12 @@ int main(int argc, char const *argv[]) {
         printf("1 Thread 1 Element: Correct\n");
     } else {
         printf("1 Thread 1 Element: Incorrect\n");
+    }
+
+    if(matEq(m, n, C_h, C_h_tiled)){
+        printf("Tiled: Correct\n");
+    } else {
+        printf("Tiled: Incorrect\n");
     }
 
     free(A_h);

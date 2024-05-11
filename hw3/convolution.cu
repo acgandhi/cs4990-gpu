@@ -99,8 +99,8 @@ __global__ void blurImage_Kernel(unsigned char *Pout, unsigned char *Pin, unsign
         float sum = 0.0f;
         for (int i = 0; i < FILTER_SIZE; ++i) {
             for (int j = 0; j < FILTER_SIZE; ++j) {
-                int row_i = row - FILTER_RADIUS + i;
-                int col_i = col - FILTER_RADIUS + j;
+                int row_i = row + i - (FILTER_RADIUS - 1);
+                int col_i = col + j - (FILTER_RADIUS - 1);
                 if (row_i >= 0 && row_i < height && col_i >= 0 && col_i < width) {
                     sum += Pin[row_i * width + col_i] * F_d[i][j];
                 } else {
@@ -126,11 +126,11 @@ void blurImage_d(cv::Mat Pout_Mat_h, cv::Mat Pin_Mat_h, unsigned int nRows, unsi
     dim3 dimBlock(32, 32);
     dim3 dimGrid((nCols + dimBlock.x - 1) / dimBlock.x, (nRows + dimBlock.y - 1) / dimBlock.y);
 
-    long start = myCpuTimer();
+    start = myCpuTimer();
     blurImage_Kernel<<<dimGrid, dimBlock>>>(Pout_d, Pin_d, nCols, nRows);
     cudaDeviceSynchronize();
-    long end = myCpuTimer();
-    printTimeDelta("GPU Time", start, end);
+    end = myCpuTimer();
+    printTimeDelta("\tGPU Compute Time", start, end);
 
     CHECK(cudaMemcpy(Pout_Mat_h.data, Pout_d, nRows * nCols * sizeof(unsigned char), cudaMemcpyDeviceToHost));
 
